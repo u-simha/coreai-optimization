@@ -1,0 +1,28 @@
+﻿coreai\_opt.quantization.spec.QParamsCalculatorBase
+===================================================
+
+.. currentmodule:: coreai_opt.quantization.spec
+
+.. autoclass:: QParamsCalculatorBase
+
+   
+   .. automethod:: __init__
+
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+   
+      ~QParamsCalculatorBase.compute_qparams
+      ~QParamsCalculatorBase.forward
+      ~QParamsCalculatorBase.get_class
+      ~QParamsCalculatorBase.list_registry_keys
+      ~QParamsCalculatorBase.list_registry_values
+      ~QParamsCalculatorBase.register
+      ~QParamsCalculatorBase.resolve
+   
+   
+
+   
+   
+   
