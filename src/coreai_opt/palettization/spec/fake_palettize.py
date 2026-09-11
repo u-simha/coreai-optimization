@@ -199,11 +199,36 @@ class _FakePalettizeImplBase(CompressionSimulatorBase, nn.Module):
             if prefixed_key in unexpected_keys:
                 unexpected_keys.remove(prefixed_key)
 
-    def enable_fake_palett(self, enabled: bool = True) -> None:
+    def enable_fake_palett(self, enabled: bool = True, reinitialize: bool = False) -> None:
+        """Enable or disable fake palettization in the forward pass.
+
+        Args:
+            enabled (bool): Whether the forward pass palettizes the tensor.
+            reinitialize (bool): On a disabled -> enabled switch, invalidate cached
+                compression params so the next forward re-derives them from the
+                current weights. Ignored when the module is already enabled. Only
+                valid when ``enabled`` is True.
+
+        Raises:
+            ValueError: If ``reinitialize`` is True while ``enabled`` is False.
+        """
+        if reinitialize and not enabled:
+            raise ValueError("reinitialize=True requires enabled=True.")
+        was_enabled = bool(self.fake_palett_enabled[0])
         self.fake_palett_enabled[0] = 1 if enabled else 0
+        if reinitialize and not was_enabled:
+            self._invalidate()
 
     def disable_fake_palett(self):
+        """Disable fake palettization in the forward pass."""
         self.enable_fake_palett(False)
+
+    @abstractmethod
+    def _invalidate(self) -> None:
+        """Invalidate cached compression params so the next forward re-derives
+        them from the current weights.
+        """
+        raise NotImplementedError()
 
 
 def _enable_fake_palett(mod):

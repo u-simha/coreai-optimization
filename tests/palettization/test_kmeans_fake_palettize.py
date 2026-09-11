@@ -1876,6 +1876,66 @@ class TestLazyInitAndStaleness:
         assert target._indices_stale is True
 
 
+class TestReinitializeOnEnable:
+    """enable_fake_palett(reinitialize=True) invalidates cached params on a
+    disabled -> enabled switch so the next forward re-clusters from the current
+    weights.
+    """
+
+    @staticmethod
+    def _make() -> _KMeansFakePalettize:
+        spec = PalettizationSpec(n_bits=2, granularity=PerTensorGranularity())
+        return _KMeansFakePalettize(**spec.__dict__)
+
+    def test_reinitialize_invalidates_and_reclusters(self):
+        palettizer = self._make()
+        palettizer(torch.tensor([-1.0, 1.0]).repeat(4, 4))
+        assert palettizer._centroids_initialized is True
+        centroids_before = palettizer.centroids.clone()
+
+        palettizer.disable_fake_palett()
+        palettizer.enable_fake_palett(True, reinitialize=True)
+        assert palettizer._centroids_initialized is False
+        assert palettizer._indices_stale is True
+
+        # Next forward re-clusters from the new weights, not the old centroids.
+        palettizer(torch.tensor([-4.0, 4.0]).repeat(4, 4))
+        assert palettizer._centroids_initialized is True
+        assert not torch.equal(palettizer.centroids, centroids_before)
+
+    def test_reinitialize_noop_when_already_enabled(self):
+        palettizer = self._make()
+        palettizer(torch.randn(8, 8))
+        assert palettizer.fake_palett_enabled[0] == 1
+        centroids_before = palettizer.centroids.clone()
+
+        # Already enabled: reinitialize is ignored, centroids survive.
+        palettizer.enable_fake_palett(True, reinitialize=True)
+        assert palettizer._centroids_initialized is True
+        palettizer(torch.randn(8, 8))
+        assert torch.equal(palettizer.centroids, centroids_before)
+
+    def test_default_keeps_centroids(self):
+        palettizer = self._make()
+        palettizer(torch.randn(8, 8))
+        centroids_before = palettizer.centroids.clone()
+
+        palettizer.disable_fake_palett()
+        palettizer.enable_fake_palett(True)  # reinitialize defaults False
+        assert palettizer._centroids_initialized is True
+        # A forward pass with different weights does not affect centroids
+        palettizer(torch.randn(8, 8))
+        assert torch.equal(palettizer.centroids, centroids_before)
+
+    def test_reinitialize_requires_enabled(self):
+        palettizer = self._make()
+        palettizer(torch.randn(8, 8))
+
+        with pytest.raises(ValueError, match="reinitialize=True requires enabled=True"):
+            palettizer.enable_fake_palett(False, reinitialize=True)
+        assert palettizer._centroids_initialized is True
+
+
 class TestQuantizeLutSTE:
     """quantize_lut() fake-quantizes the LUT through a straight-through estimator."""
 
@@ -2000,3 +2060,40 @@ def test_device_placement_on_accelerator(accelerator_device):
     out = palettizer.hard_assign(weight)
     assert out.device.type == device
     assert out.shape == weight.shape
+
+
+_ROUNDTRIP_SPECS = [
+    pytest.param(PerTensorGranularity(), 1, id="pt-cd1"),
+    pytest.param(PerTensorGranularity(), 2, id="pt-cd2"),
+    pytest.param(PerTensorGranularity(), 4, id="pt-cd4"),
+    pytest.param(PerGroupedChannelGranularity(axis=0, group_size=8), 1, id="pgc-ax0-gs8-cd1"),
+    pytest.param(PerGroupedChannelGranularity(axis=0, group_size=16), 4, id="pgc-ax0-gs16-cd4"),
+    pytest.param(PerGroupedChannelGranularity(axis=1, group_size=8), 1, id="pgc-ax1-gs8-cd1"),
+]
+
+
+@pytest.mark.parametrize("enable_per_channel_scale", [False, True], ids=["no-pcs", "pcs"])
+@pytest.mark.parametrize("granularity, cluster_dim", _ROUNDTRIP_SPECS)
+def test_vectorize_devectorize_round_trip(granularity, cluster_dim, enable_per_channel_scale):
+    """``devectorize`` inverts ``vectorize``.
+
+    Covers scaling on/off across granularity and cluster_dim, independent of
+    clustering — the round trip must reconstruct the original weight.
+    """
+    torch.manual_seed(0)
+    spec = PalettizationSpec(
+        n_bits=4,
+        granularity=granularity,
+        cluster_dim=cluster_dim,
+        enable_per_channel_scale=enable_per_channel_scale,
+        lut_qspec=None,
+    )
+    palettizer = _KMeansFakePalettize(**spec.__dict__)
+    weight = torch.randn(16, 32)
+
+    vectors, context = palettizer.vectorize(weight)
+    reconstructed = palettizer.devectorize(vectors, context)
+
+    assert reconstructed.shape == weight.shape
+    assert reconstructed.dtype == weight.dtype
+    assert torch.allclose(reconstructed, weight, atol=1e-5)
