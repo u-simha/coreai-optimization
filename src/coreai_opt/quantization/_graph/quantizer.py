@@ -46,6 +46,7 @@ from coreai_opt._utils.torch_utils import export_model, move_model_to_eval, move
 from coreai_opt._utils.version_utils import version_ge
 from coreai_opt.common import ExportBackend
 from coreai_opt.config.compression_config import ModuleConfigDict, _build_module_alias_map
+from coreai_opt.config.spec.compression_simulator import CompressionSimulatorBase
 from coreai_opt.quantization._axis_defaults import (
     apply_weight_axis_defaults_graph as _apply_weight_axis_defaults,
     validate_activation_axes,
@@ -97,6 +98,22 @@ from ._utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _record_tensor_fqns_graph(model: torch.fx.GraphModule) -> None:
+    """Record the FQN of each compressed parameter on the simulator compressing it.
+
+    A simulator reading from anything other than a ``get_attr`` node keeps the
+    default name: an activation, or a weight arriving through a decompression op,
+    has no parameter to name.
+    """
+    simulators = dict(model.named_modules(remove_duplicate=False))
+    for node in model.graph.nodes:
+        if node.op != "call_module" or not node.args:
+            continue
+        simulator = simulators.get(str(node.target))
+        if isinstance(simulator, CompressionSimulatorBase) and node.args[0].op == "get_attr":
+            simulator.tensor_fqn = str(node.args[0].target)
 
 
 class _OpConfigLevel(Enum):
@@ -1378,6 +1395,8 @@ class GraphQuantizer(_BaseQuantizer):
         # with their inputs but invalidate axis semantics, so per-channel/per-block
         # granularity is mathematically incorrect. Force per-tensor.
         force_per_tensor_for_channel_altering_ops(model)
+
+        _record_tensor_fqns_graph(model)
 
         # Apply weight axis defaults for per channel and per block quantization
         _apply_weight_axis_defaults(model)
