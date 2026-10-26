@@ -17,6 +17,7 @@ from coreai_opt._utils.spec_utils import (
 from coreai_opt.config.spec import CompressionSimulatorBase
 from coreai_opt.palettization.spec import (
     PalettizationGranularity,
+    PerGroupedChannelGranularity,
 )
 from coreai_opt.quantization.spec import QuantizationSpec
 
@@ -38,6 +39,7 @@ class _FakePalettizeImplBase(CompressionSimulatorBase, nn.Module):
         granularity: PalettizationGranularity,
         cluster_dim: int,
         enable_per_channel_scale: bool,
+        sparsity_detection_threshold: float | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -46,6 +48,7 @@ class _FakePalettizeImplBase(CompressionSimulatorBase, nn.Module):
         self.granularity = granularity
         self.cluster_dim = cluster_dim
         self.enable_per_channel_scale = enable_per_channel_scale
+        self.sparsity_detection_threshold = sparsity_detection_threshold
 
         self.register_buffer("fake_palett_enabled", torch.tensor([1], dtype=torch.uint8))
         # Non-persistent (kept out of new checkpoints); when set to 1 (at runtime or
@@ -54,6 +57,8 @@ class _FakePalettizeImplBase(CompressionSimulatorBase, nn.Module):
             "observer_enabled", torch.tensor([0], dtype=torch.uint8), persistent=False
         )
         self._disabled = False
+        self.register_buffer("_sparsity_mask", None, persistent=False)
+        self._sparsity_detected = False
 
         self.register_buffer("indices", None)
         self.register_buffer("per_channel_scale", None)
@@ -71,6 +76,13 @@ class _FakePalettizeImplBase(CompressionSimulatorBase, nn.Module):
         if self._disabled:
             return tensor
 
+        if self.sparsity_detection_threshold is not None and not self._sparsity_detected:
+            self._sparsity_mask = self._detect_sparsity_mask(tensor)
+            self._sparsity_detected = True
+        if self._sparsity_mask is not None:
+            # Keep the detected zeros fixed, even if training moves those weights.
+            tensor = tensor * self._sparsity_mask
+
         self.ensure_initialized(tensor)
 
         # Check for self._disabled again in case ensure_initialized disabled the palettizer.
@@ -78,7 +90,34 @@ class _FakePalettizeImplBase(CompressionSimulatorBase, nn.Module):
             return tensor
         if self.fake_palett_enabled[0] == 0:
             return tensor
-        return self.forward_enabled(tensor)
+        palettized = self.forward_enabled(tensor)
+        if self._sparsity_mask is not None:
+            # The palette covers only the nonzero weights; the mask restores the zeros.
+            palettized = palettized * self._sparsity_mask
+        return palettized
+
+    def _axis0_group_size(self) -> int | None:
+        """Return the channel group size of axis-0 grouped granularity, else ``None``."""
+        granularity = self.granularity
+        if isinstance(granularity, PerGroupedChannelGranularity) and granularity.axis == 0:
+            return granularity.group_size
+        return None
+
+    def _has_uneven_groups(self) -> bool:
+        """Return True if the sparsity mask leaves axis-0 channel groups unevenly filled."""
+        group_size = self._axis0_group_size()
+        if self._sparsity_mask is None or group_size is None:
+            return False
+        # The granularity guarantees the channel count is divisible by the group size.
+        counts = self._sparsity_mask.reshape(self._sparsity_mask.shape[0] // group_size, -1)
+        return counts.sum(dim=1).unique().numel() > 1
+
+    def _detect_sparsity_mask(self, tensor: torch.Tensor) -> torch.Tensor | None:
+        """Return the nonzero mask of ``tensor`` if it is sparse enough, else ``None``."""
+        num_zeros = tensor.numel() - torch.count_nonzero(tensor).item()
+        if num_zeros == 0 or num_zeros < self.sparsity_detection_threshold * tensor.numel():
+            return None
+        return tensor != 0
 
     @abstractmethod
     def ensure_initialized(self, tensor: torch.Tensor) -> None:

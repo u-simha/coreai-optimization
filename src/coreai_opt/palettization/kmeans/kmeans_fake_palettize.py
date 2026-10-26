@@ -102,6 +102,7 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         vector_kmeans_config: VectorKMeansConfig | dict | None = None,
         op_to_optimize: Callable | None = None,
         training_strategy_spec: TrainingStrategySpec | None = None,
+        sparsity_detection_threshold: float | None = None,
     ):
         super().__init__(
             n_bits=n_bits,
@@ -109,6 +110,7 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
             granularity=granularity,
             cluster_dim=cluster_dim,
             enable_per_channel_scale=enable_per_channel_scale,
+            sparsity_detection_threshold=sparsity_detection_threshold,
         )
 
         self.enable_fast_kmeans_mode = enable_fast_kmeans_mode
@@ -471,7 +473,17 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         else:
             block_sensitivities = [None] * len(block_weights_to_cluster)
 
+        if self._sparsity_mask is not None:
+            mask = self.reshape_strategy.reshape_for_kmeans(self._sparsity_mask.cpu(), axis)
+            block_masks = self.granularity.get_blocks_to_cluster(mask)
+        else:
+            block_masks = [None] * len(block_weights_to_cluster)
+
         num_clusters = 2**self.n_bits
+
+        # Must match the zero padding done by _pad_mask_to_equal_groups in _prepare_for_export.py,
+        # whose padded zeros must look up 0.0 (a reused palette holds it at another position).
+        reserve_zero = self._has_uneven_groups()
 
         # Reuse the palette of leading blocks that are already clustered; detection stops
         # at the first block that is not.
@@ -487,14 +499,22 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
 
         remaining_weights = block_weights_to_cluster[n_kmeans_skipped:]
         remaining_sensitivities = block_sensitivities[n_kmeans_skipped:]
+        remaining_masks = block_masks[n_kmeans_skipped:]
         if self.cluster_dim == 1:
             block_results += [
-                self._cluster_weights_1d(block_weight, block_sensitivity)
-                for block_weight, block_sensitivity in zip(
-                    remaining_weights, remaining_sensitivities, strict=True
+                (
+                    self._cluster_weights_1d_masked(
+                        block_weight, block_mask, block_sensitivity, reserve_zero
+                    )
+                    if block_mask is not None
+                    else self._cluster_weights_1d(block_weight, block_sensitivity)
+                )
+                for block_weight, block_sensitivity, block_mask in zip(
+                    remaining_weights, remaining_sensitivities, remaining_masks, strict=True
                 )
             ]
         elif remaining_weights:
+            # A mask with cluster_dim != 1 is ignored here; export rejects that combination.
             block_results += self._cluster_weights_2d(remaining_weights, remaining_sensitivities)
 
         centroids_per_block = []
@@ -794,11 +814,12 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         self,
         block_weight: torch.Tensor,
         block_sensitivity: torch.Tensor | None,
+        num_clusters: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Cluster weights such that each centroid is a 1d scalar, i.e., cluster_dim == 1.
         """
-        num_clusters = 2**self.n_bits
+        num_clusters = num_clusters or 2**self.n_bits
 
         # numpy has no bfloat16 dtype, so cluster bf16 weights as float32. The
         # centroids are cast back to the weight dtype by the caller.
@@ -848,6 +869,43 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         clusters = torch.from_numpy(np.array(kmeans_results.clusters))
 
         return centroids, clusters
+
+    def _cluster_weights_1d_masked(
+        self,
+        block_weight: torch.Tensor,
+        block_mask: torch.Tensor,
+        block_sensitivity: torch.Tensor | None,
+        reserve_zero: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cluster only the kept weights, sending masked-out elements to centroid 0.
+
+        With ``reserve_zero``, centroid 0 is exactly 0.0 and the kept weights use the other
+        ``2**n_bits - 1`` centroids; otherwise all ``2**n_bits`` centroids fit the kept weights.
+
+        Args:
+            block_weight (torch.Tensor): Weights of the block to cluster.
+            block_mask (torch.Tensor): Nonzero mask of the block, same shape as ``block_weight``.
+            block_sensitivity (torch.Tensor | None): Optional per-element sensitivities.
+            reserve_zero (bool): Whether to reserve centroid 0 for exactly 0.0.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: Centroids and flat per-element cluster assignment.
+        """
+        flat_weight = block_weight.flatten()
+        keep = block_mask.flatten().bool()
+        clusters = torch.zeros(flat_weight.numel(), dtype=torch.long)
+        if not keep.any():
+            return torch.zeros(2**self.n_bits, dtype=flat_weight.dtype), clusters
+        kept_sensitivity = None if block_sensitivity is None else block_sensitivity.flatten()[keep]
+        if not reserve_zero:
+            centroids, kept_clusters = self._cluster_weights_1d(flat_weight[keep], kept_sensitivity)
+            clusters[keep] = kept_clusters.long()
+            return centroids, clusters
+        centroids, kept_clusters = self._cluster_weights_1d(
+            flat_weight[keep], kept_sensitivity, num_clusters=2**self.n_bits - 1
+        )
+        clusters[keep] = kept_clusters.long() + 1
+        return torch.cat([torch.zeros(1, dtype=centroids.dtype), centroids]), clusters
 
     def _cluster_weights_2d(
         self,
