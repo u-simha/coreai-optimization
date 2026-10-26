@@ -459,6 +459,9 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         num_clusters, cluster_dim)`` tensor, and ``indices`` is the per-element
         cluster assignment produced directly by the clustering algorithm.
         """
+        if self._sparsity_mask is not None and self.cluster_dim > 1:
+            return self._cluster_nonzero_vectors(original_weights, sensitivities)
+
         weight = original_weights.cpu()
         block_weights_to_cluster, axis = self._scale_reshape_and_block(weight)
 
@@ -514,7 +517,6 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
                 )
             ]
         elif remaining_weights:
-            # A mask with cluster_dim != 1 is ignored here; export rejects that combination.
             block_results += self._cluster_weights_2d(remaining_weights, remaining_sensitivities)
 
         centroids_per_block = []
@@ -552,6 +554,11 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         """Nearest-centroid hard assignment of ``original_weights`` against a
         given ``centroids`` (P, K, D) tensor.
         """
+        if self._sparsity_mask is not None and self.cluster_dim > 1:
+            vectors = self._scaled_nonzero_vectors(original_weights.detach().cpu())
+            distances = torch.cdist(vectors.float(), centroids.detach().cpu().float()[0])
+            return distances.argmin(dim=-1).to(torch.uint8)
+
         blocks, axis = self._scale_reshape_and_block(original_weights.detach().cpu())
         centroids_cpu = centroids.detach().cpu().float()
 
@@ -605,10 +612,12 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
             This method assumes that group_size is divisible by the weight shape
             along the grouped axis, so all blocks have the same size.
         """
+        lut = lut.to(indices.device)
+        if self._sparsity_mask is not None and self.cluster_dim > 1:
+            return self._palettize_nonzero_vectors(lut, indices, original_weights)
+
         clustered_weight = None
         axis = self._resolved_axis
-
-        lut = lut.to(indices.device)
 
         # Reshape indices back to 2D for block processing (reverse of
         # reshape_to_original in _assign_indices)
@@ -676,6 +685,62 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         if self.enable_per_channel_scale:
             clustered_weight = self._unscale_by_per_channel_scale(clustered_weight)
 
+        return clustered_weight.to(original_weights.device, original_weights.dtype)
+
+    def _nonzero_vectors(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Return the nonzeros of a CPU ``tensor`` as ``(nnz / cluster_dim, cluster_dim)`` vectors.
+
+        Each vector holds ``cluster_dim`` consecutive nonzeros in row-major order, the order
+        ``sparse_to_dense`` consumes them in.
+        """
+        return tensor[self._sparsity_mask.cpu()].reshape(-1, self.cluster_dim)
+
+    def _scaled_nonzero_vectors(self, weight: torch.Tensor) -> torch.Tensor:
+        """Return ``_nonzero_vectors`` of a CPU ``weight``, per-channel scaled if enabled."""
+        if self.enable_per_channel_scale:
+            weight = self._scale_by_per_channel_scale(weight)
+        return self._nonzero_vectors(weight)
+
+    @torch.no_grad()
+    def _cluster_nonzero_vectors(
+        self, original_weights: torch.Tensor, sensitivities: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Vector-cluster the nonzero values of a sparse weight, per tensor.
+
+        Returns ``(centroids, indices)``: ``centroids`` is a ``(1, num_clusters, cluster_dim)``
+        tensor and ``indices`` holds one cluster assignment per vector of nonzero values.
+        """
+        weight = original_weights.cpu()
+        vectors = self._scaled_nonzero_vectors(weight)
+        vector_sensitivities = None
+        if sensitivities is not None:
+            # Per-vector importance: sensitivities summed along cluster_dim.
+            vector_sensitivities = [self._nonzero_vectors(sensitivities.cpu().float()).sum(dim=-1)]
+
+        num_clusters = 2**self.n_bits
+        settings = self.vector_kmeans_config
+        ((centroids, clusters),) = _cluster_vectors(
+            [vectors],
+            vector_sensitivities,
+            min(len(vectors), num_clusters),
+            n_local_trials=settings.n_local_trials,
+            n_init=settings.n_init,
+            max_iter=settings.max_iter,
+            tol=settings.tol,
+        )
+        centroids = self._pad_lut_to_num_clusters(centroids, num_clusters).to(weight.dtype)
+        return centroids.unsqueeze(0).to(original_weights.device), clusters.to(torch.uint8)
+
+    def _palettize_nonzero_vectors(
+        self, lut: torch.Tensor, indices: torch.Tensor, original_weights: torch.Tensor
+    ) -> torch.Tensor:
+        """Scatter the looked-up vectors back to the nonzero positions; the rest stay zero."""
+        values = lut.reshape(-1, self.cluster_dim)[indices.long()].flatten()
+        clustered_weight = torch.zeros(original_weights.shape, dtype=values.dtype).masked_scatter(
+            self._sparsity_mask.cpu(), values
+        )
+        if self.enable_per_channel_scale:
+            clustered_weight = self._unscale_by_per_channel_scale(clustered_weight)
         return clustered_weight.to(original_weights.device, original_weights.dtype)
 
     def _pad_lut_to_num_clusters(

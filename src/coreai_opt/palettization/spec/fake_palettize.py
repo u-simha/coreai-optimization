@@ -18,6 +18,7 @@ from coreai_opt.config.spec import CompressionSimulatorBase
 from coreai_opt.palettization.spec import (
     PalettizationGranularity,
     PerGroupedChannelGranularity,
+    PerTensorGranularity,
 )
 from coreai_opt.quantization.spec import QuantizationSpec
 
@@ -117,7 +118,43 @@ class _FakePalettizeImplBase(CompressionSimulatorBase, nn.Module):
         num_zeros = tensor.numel() - torch.count_nonzero(tensor).item()
         if num_zeros == 0 or num_zeros < self.sparsity_detection_threshold * tensor.numel():
             return None
-        return tensor != 0
+        mask = tensor != 0
+        if self.cluster_dim > 1:
+            mask = self._align_mask_to_cluster_dim(mask, tensor)
+        return mask
+
+    def _align_mask_to_cluster_dim(
+        self, mask: torch.Tensor, tensor: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Drop the smallest nonzeros so that all vectors of nonzero values are full.
+
+        Vector palettization clusters groups of ``cluster_dim`` consecutive nonzeros, so their
+        count must be a multiple of ``cluster_dim``. At most ``cluster_dim - 1`` weights are
+        dropped from the mask.
+
+        Args:
+            mask (torch.Tensor): Boolean nonzero mask of ``tensor``.
+            tensor (torch.Tensor): The weight the mask was detected on.
+
+        Returns:
+            torch.Tensor | None: The aligned mask, or ``None`` if no nonzeros are left.
+
+        Raises:
+            ValueError: If the granularity is not per-tensor.
+        """
+        if not isinstance(self.granularity, PerTensorGranularity):
+            raise ValueError(
+                f"'{self.tensor_fqn}': joint sparsity with cluster_dim={self.cluster_dim} "
+                f"requires per-tensor granularity, got {self.granularity}."
+            )
+        remainder = int(mask.sum()) % self.cluster_dim
+        if remainder:
+            flat_mask = mask.flatten().clone()
+            nonzero_positions = flat_mask.nonzero().flatten()
+            smallest = tensor.flatten()[nonzero_positions].abs().argsort()[:remainder]
+            flat_mask[nonzero_positions[smallest]] = False
+            mask = flat_mask.reshape(mask.shape)
+        return mask if mask.any() else None
 
     @abstractmethod
     def ensure_initialized(self, tensor: torch.Tensor) -> None:

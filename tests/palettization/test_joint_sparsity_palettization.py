@@ -26,7 +26,6 @@ from coreai_opt.palettization.kmeans._prepare_for_export import (
     _SparsePalettizeModule,
 )
 from coreai_opt.palettization.kmeans.kmeans_fake_palettize import _KMeansFakePalettize
-from coreai_opt.palettization.spec import PerGroupedChannelGranularity
 from coreai_opt.quantization.spec import QuantizationScheme, QuantizationSpec
 from tests.test_utils.joint_sparsity import (
     GROUP_SIZE,
@@ -239,6 +238,103 @@ def test_round_trip(group_size, presparse_group_size, uneven, n_bits, small_mode
         assert torch.equal(layer.weight, prepared_weights[name]), name
 
 
+def _zero_smallest_nonzeros(layer: nn.Module, count: int) -> None:
+    """Zero the ``count`` smallest-magnitude nonzero weights of ``layer``."""
+    with torch.no_grad():
+        flat = layer.weight.view(-1)
+        nonzero = flat.nonzero().flatten()
+        flat[nonzero[flat[nonzero].abs().argsort()[:count]]] = 0
+
+
+@pytest.mark.parametrize("enable_per_channel_scale", [False, True], ids=["no_scale", "scale"])
+@pytest.mark.parametrize(
+    "cluster_dim,extra_zeros",
+    [(2, 0), (2, 1), (4, 1), (4, 3)],
+    ids=["dim2_aligned", "dim2_remainder", "dim4_remainder1", "dim4_remainder3"],
+)
+def test_vector_palettization_of_nonzeros(
+    cluster_dim, extra_zeros, enable_per_channel_scale, small_model, small_input
+):
+    model = presparsify(small_model, SPARSITY, layers=_SPARSE_LAYERS)
+    for name in _SPARSE_LAYERS:
+        _zero_smallest_nonzeros(getattr(model, name), extra_zeros)
+    nonzeros_before = {name: getattr(model, name).weight != 0 for name in _LAYERS}
+    weights_before = _weights(model, _LAYERS)
+
+    palettizer = build_palettizer(
+        model,
+        n_bits=3,
+        cluster_dim=cluster_dim,
+        enable_per_channel_scale=enable_per_channel_scale,
+    )
+    prepared = palettizer.prepare((small_input,))
+    prepared_weights = _weights(prepared, _LAYERS)
+
+    masks = {}
+    for name in _SPARSE_LAYERS:
+        fake = _fake(prepared, name)
+        mask = masks[name] = fake._sparsity_mask.clone()
+        # The smallest nonzeros are dropped until the vectors are full; nothing else changes.
+        num_dropped = int(nonzeros_before[name].sum()) % cluster_dim
+        assert int(mask.sum()) % cluster_dim == 0, name
+        assert int(nonzeros_before[name].sum() - mask.sum()) == num_dropped, name
+        assert not (mask & ~nonzeros_before[name]).any(), name
+        dropped = weights_before[name][nonzeros_before[name] & ~mask].abs()
+        kept = weights_before[name][mask].abs()
+        assert dropped.numel() == 0 or dropped.max() <= kept.min(), name
+
+        # One LUT of 2**n_bits vectors, and one index per vector of nonzero values.
+        assert fake.lut.shape == (1, 1, 8, cluster_dim), name
+        assert fake.indices.shape == (int(mask.sum()) // cluster_dim,), name
+        assert torch.equal(prepared_weights[name] != 0, mask), name
+
+    # A layer without zeros is vector-palettized densely.
+    assert _fake(prepared, "conv2")._sparsity_mask is None
+    assert _fake(prepared, "conv2").indices.shape == (16 // cluster_dim, 8, 3, 3)
+
+    finalized = palettizer.finalize(backend=_COREAI)
+    assert _sparse_module(finalized.conv2) is None
+    for name in _SPARSE_LAYERS:
+        layer = getattr(finalized, name)
+        sparse_module = _sparse_module(layer)
+        mask = masks[name]
+        assert torch.equal(sparse_module.mask, mask), name
+        assert sparse_module.lut.shape == (1, 8, cluster_dim), name
+        assert sparse_module.nonzero_indices.shape == (int(mask.sum()) // cluster_dim,), name
+
+        # lut_to_dense expands each index into consecutive nonzeros, in the mask's row-major order.
+        nonzeros = sparse_module.lut[0][sparse_module.nonzero_indices.long()].flatten()
+        rebuilt = torch.zeros(mask.shape).masked_scatter(mask, nonzeros)
+        if enable_per_channel_scale:
+            torch.testing.assert_close(layer.weight, prepared_weights[name], rtol=1e-5, atol=1e-6)
+        else:
+            assert torch.equal(rebuilt, prepared_weights[name]), name
+            assert torch.equal(layer.weight, prepared_weights[name]), name
+
+
+def test_vector_palettization_of_nonzeros_edge_cases():
+    # Grouped LUTs cannot hold vectors of nonzero values: a sparse layer fails at detection.
+    model = presparsify(nn.Sequential(nn.Linear(8, 4)), SPARSITY)
+    grouped = build_palettizer(model, cluster_dim=2, **spec_kwargs(2, GROUP_SIZE))
+    with pytest.raises(RuntimeError, match="Centroid calculation failed") as exc_info:
+        grouped.prepare((torch.randn(1, 8),))
+    assert "requires per-tensor granularity" in str(exc_info.value.__cause__)
+
+    # A single nonzero cannot fill a vector, so the layer is palettized densely, which is exact
+    # here since it holds only two distinct vectors.
+    model = nn.Sequential(nn.Linear(8, 4))
+    with torch.no_grad():
+        model[0].weight.zero_()
+        model[0].weight[1, 2] = 1.0
+    original = model[0].weight.detach().clone()
+    palettizer = build_palettizer(model, n_bits=2, cluster_dim=2)
+    prepared = palettizer.prepare((torch.randn(1, 8),))
+    assert prepared[0].parametrizations.weight[0]._sparsity_mask is None
+    finalized = palettizer.finalize(backend=_COREAI)
+    assert _sparse_module(finalized[0]) is None
+    assert torch.equal(finalized[0].weight, original)
+
+
 _SCALE_FEATURES = {
     "per_channel_scale": {"enable_per_channel_scale": True},
     "lut_qspec": {"lut_qspec": SYMMETRIC_LUT_QSPEC},
@@ -371,13 +467,11 @@ def test_pad_mask_to_equal_groups():
 
 
 _VECTOR = {"n_bits": 4, "cluster_dim": 2}
-_VECTOR_GROUPED = {**_VECTOR, "granularity": PerGroupedChannelGranularity(axis=0, group_size=4)}
 _REJECTS = {
     # CoreAI supports scalar palettization, per-tensor or axis-0 grouped, and zero-point-free
-    # LUT quantization.
+    # LUT quantization; and per-tensor vector palettization without LUT quantization.
     _COREAI: {
-        "vector_per_tensor": _VECTOR,
-        "vector_grouped": _VECTOR_GROUPED,
+        "vector_lut_qspec": {**_VECTOR, "lut_qspec": SYMMETRIC_LUT_QSPEC},
         "grouped_axis1": spec_kwargs(4, 4, axis=1),
         "lut_qspec_int8_zero_point": {
             "n_bits": 4,
@@ -388,10 +482,10 @@ _REJECTS = {
             "lut_qspec": QuantizationSpec(dtype=torch.uint8, qscheme=QuantizationScheme.ASYMMETRIC),
         },
     },
-    # CoreML cannot convert the vector index/mask sizes, or the scale after its sparse LUT op.
+    # CoreML takes a vector mask on the grid of vectors, so it cannot express vectors of nonzero
+    # values, and it cannot convert the scale after its sparse LUT op.
     _COREML: {
         "vector_per_tensor": _VECTOR,
-        "vector_grouped": _VECTOR_GROUPED,
         "lut_qspec": {"n_bits": 4, "lut_qspec": SYMMETRIC_LUT_QSPEC},
     },
 }

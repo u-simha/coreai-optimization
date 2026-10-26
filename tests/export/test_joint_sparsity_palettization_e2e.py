@@ -143,6 +143,30 @@ def test_mnist(
     _assert_op_order(converted, backend, len(_MNIST_LAYERS), scaled=bool(extra))
 
 
+@pytest.mark.parametrize(
+    "cluster_dim,extra",
+    [(2, {}), (4, _SCALE)],
+    ids=["dim2", "dim4_per_channel_scale"],
+)
+def test_mnist_vector_palettization(
+    cluster_dim, extra, custom_test_mnist_model, mnist_example_input
+):
+    # Pruning a hair under half leaves most layers with a nonzero count that is not a multiple
+    # of cluster_dim, so the smallest nonzeros are dropped from the mask.
+    model = presparsify(custom_test_mnist_model, 0.4999)
+    converted = _export(
+        _COREAI,
+        model,
+        mnist_example_input,
+        {**spec_kwargs(4, None), "cluster_dim": cluster_dim, **extra},
+        len(_MNIST_LAYERS),
+        scaled=bool(extra),
+        snr_thresh=40.0,
+        psnr_thresh=40.0,
+    )
+    _assert_op_order(converted, _COREAI, len(_MNIST_LAYERS), scaled=bool(extra))
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize("backend", [_COREAI, _COREML], ids=["coreai", "coreml"])
 @pytest.mark.parametrize(

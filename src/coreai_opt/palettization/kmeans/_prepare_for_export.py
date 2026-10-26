@@ -59,6 +59,13 @@ class _SparsePalettizeModule(nn.Module):
     With per-group granularity for palettization, each group should have the same number of
     non zero values (this can be achieved by padding if needed).
 
+    With vector palettization (``cluster_dim = d > 1``, per-tensor only), the extracted ``nnz``
+    nonzero values are clustered in vectors of ``d`` consecutive values, so there are
+    ``nnz // d`` indices: ``nonzero_indices`` is ``[nnz // d]`` and ``lut`` is
+    ``[1, 2**n_bits, d]``. ``lut_to_dense`` expands every index into ``d`` values, giving
+    ``[nnz]``, and ``sparse_to_dense`` scatters them as above. If ``nnz % d != 0``, the
+    remainder of the nonzero values (the smallest ones) is zeroed out before clustering.
+
     For a weight of shape ``[C_out, C_in, ...]``, ``nnz`` nonzero values and ``n_bits`` bits:
 
     - Per-tensor: ``nonzero_indices`` is ``[nnz]`` and ``lut`` is ``[1, 2**n_bits, 1]``.
@@ -84,8 +91,8 @@ class _SparsePalettizeModule(nn.Module):
         self.register_buffer("lut", lut.reshape(-1, lut.shape[-2], lut.shape[-1]))
         self.register_buffer("mask", mask)
         self.register_buffer("scale", scale)
-        # Scalar palettization only (cluster_dim == 1), so the vector axis is the default.
-        self.vector_axis = _DEFAULT_VECTOR_AXIS
+        # The nonzero values are a rank-1 list, so their vectors always run along axis 0.
+        self.vector_axis = 0
 
     def forward(self, _: Any) -> torch.Tensor:
         nonzero_values = torch.ops.coreai.lut_to_dense(
@@ -124,7 +131,9 @@ def _build_sparse_palettize_module(
                 "symmetric lut_qspec), since masked-out weights must dequantize to exactly 0."
             )
 
-    nonzero_indices = palett_info.indices[mask]
+    # Vector palettization already stores one index per vector of nonzero values.
+    indices = palett_info.indices
+    nonzero_indices = indices if palett_info.cluster_dim > 1 else indices[mask]
     return _SparsePalettizeModule(nonzero_indices, lut, mask, scale)
 
 
@@ -314,13 +323,16 @@ def _resolve_mlir_lut_and_scale(
 def _validate_coreml_sparsity_support(fake_palett_mod: _FakePalettizeImplBase) -> None:
     """Reject CoreML joint sparsity with vector palettization or LUT quantization.
 
+    ``constexpr_lut_to_sparse`` takes its mask on the grid of vectors, so a vector is kept or
+    dropped as a whole; it cannot express nonzero values grouped into vectors.
+
     Raises:
         ValueError: If ``cluster_dim != 1`` or ``lut_qspec`` is set.
     """
     if fake_palett_mod.cluster_dim != 1:
         raise ValueError(
             f"cluster_dim={fake_palett_mod.cluster_dim} (vector palettization) "
-            "not supported for joint sparsity."
+            "not supported for joint sparsity on CoreML."
         )
     if fake_palett_mod.lut_qspec is not None:
         raise ValueError("lut_qspec not supported for joint sparsity on CoreML.")
@@ -331,7 +343,8 @@ def _validate_coreai_sparsity_support(
 ) -> None:
     """Reject joint sparsity configurations the CoreAI sparse op chain cannot represent.
 
-    The chain maps contiguous axis-0 blocks to LUTs and supports scalar palettization only.
+    The chain maps contiguous axis-0 blocks to LUTs. Vector palettization (per-tensor only,
+    enforced when the sparsity is detected) does not support LUT quantization.
 
     Args:
         fake_palett_mod (_FakePalettizeImplBase): The fake palettization module.
@@ -339,16 +352,15 @@ def _validate_coreai_sparsity_support(
 
     Raises:
         ValueError: If the granularity is neither per-tensor nor axis-0 grouped, or
-            ``cluster_dim != 1`` (vector palettization).
+            ``cluster_dim != 1`` (vector palettization) is combined with ``lut_qspec``.
     """
     granularity = fake_palett_mod.granularity
     is_per_tensor = isinstance(granularity, PerTensorGranularity)
     if not (is_per_tensor or fake_palett_mod._axis0_group_size() is not None):
         raise ValueError(f"{context}granularity={granularity} not supported for joint sparsity.")
-    if fake_palett_mod.cluster_dim != 1:
+    if fake_palett_mod.cluster_dim != 1 and fake_palett_mod.lut_qspec is not None:
         raise ValueError(
-            f"{context}cluster_dim={fake_palett_mod.cluster_dim} (vector palettization) "
-            "not supported for joint sparsity."
+            f"{context}lut_qspec not supported for joint sparsity with vector palettization."
         )
 
 
