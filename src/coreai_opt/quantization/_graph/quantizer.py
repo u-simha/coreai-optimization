@@ -42,7 +42,13 @@ from torchao.quantization.pt2e.quantizer.quantizer import Q_ANNOTATION_KEY
 
 from coreai_opt._utils.config_utils import ALL_TENSORS, ConfigLevel
 from coreai_opt._utils.fx_utils import get_node_type, normalize_module_fqn
-from coreai_opt._utils.torch_utils import export_model, move_model_to_eval, move_model_to_train
+from coreai_opt._utils.metadata_utils import STATE_DICT_METADATA_BUFFER_PREFIX
+from coreai_opt._utils.torch_utils import (
+    export_model,
+    get_parent_module_and_attr_name,
+    move_model_to_eval,
+    move_model_to_train,
+)
 from coreai_opt._utils.version_utils import version_ge
 from coreai_opt.common import ExportBackend
 from coreai_opt.config.compression_config import ModuleConfigDict, _build_module_alias_map
@@ -83,6 +89,7 @@ from ._prepare_for_export import (
     _move_cache_dequant_to_output,
     prepare_for_mil_export,
     prepare_for_mlir_export,
+    prepare_for_torch_inference,
 )
 from ._qspec_reconcile import (
     _AnnotationContext,
@@ -1112,16 +1119,14 @@ class GraphQuantizer(_BaseQuantizer):
 
         This method converts the prepared model with fake quantization modules to a
         final quantized model with actual quantized operations, ready for deployment
-        to the target export backend.
-
-        Only call ``finalize`` when exporting to a target backend. For torch-based
-        evaluation, use the model returned by ``prepare()`` directly rather than
-        calling ``finalize``.
+        to the target export backend. For ``backend=ExportBackend.Torch``, weight fake
+        quantization is folded into dense weights and activation fake quantization
+        is kept.
 
         Args:
             model: Optional model to finalize. If None, uses the internal prepared model.
-            backend: Target export backend for the quantized model.
-                Supports CoreAI (default) and CoreML.
+            backend: Target backend for the quantized model.
+                Supports CoreAI (default), CoreML and Torch.
             mmap_dir (str | None): If provided, each quantized weight is serialized to
                 its own safetensors file under this directory and re-read mmap-backed.
                 Only supported with the CoreAI backend.
@@ -1145,6 +1150,14 @@ class GraphQuantizer(_BaseQuantizer):
 
         # Retrieve preserved attributes before conversion
         preserved_attrs = model.meta.get(_USER_PRESERVED_ATTRIBUTES_KEY, {})
+        # convert_pt2e rebuilds the GraphModule keeping only attributes referenced by the
+        # graph, which drops compression metadata buffers registered by a prior finalize
+        # (e.g. palettization for CoreML export), so save them to restore afterwards.
+        metadata_buffers = {
+            name: buffer
+            for name, buffer in model.named_buffers()
+            if STATE_DICT_METADATA_BUFFER_PREFIX in name
+        }
 
         # Always first call convert_pt2e API.
         # We disable fold_quantize purely to save memory: torchao's constant_fold
@@ -1159,16 +1172,19 @@ class GraphQuantizer(_BaseQuantizer):
 
         # Re-attach preserved attributes to finalized model
         self._attach_preserved_attrs_to_model(finalized_model, preserved_attrs)
+        for name, buffer in metadata_buffers.items():
+            module, buffer_name = get_parent_module_and_attr_name(finalized_model, name)
+            module.register_buffer(buffer_name, buffer)
         # Post-conversion processing (conv+bn folding, etc.)
         finalized_model = self._post_conversion_process(finalized_model)
 
         # Backend-specific processing
         match backend:
-            case ExportBackend._TORCH:
+            case ExportBackend.Torch:
                 # KV-cache quantization is a no-op for the torch backend: the
                 # fake-quant observers on the cache op input stay in the graph.
                 # Cache-buffer retyping only happens on the CoreAI backend.
-                pass
+                finalized_model = prepare_for_torch_inference(finalized_model)
 
             case ExportBackend.CoreML:
                 if self._config.kv_cache_quant_configs:
@@ -1199,6 +1215,7 @@ class GraphQuantizer(_BaseQuantizer):
         # allow_exported_model_train_eval again on the converted model.
         allow_exported_model_train_eval(finalized_model)
 
+        self._unmark_model_as_prepared(finalized_model)
         return finalized_model
 
     @contextmanager

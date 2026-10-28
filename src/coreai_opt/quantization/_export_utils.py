@@ -418,7 +418,7 @@ def validate_activation_export_supported(fake_quant_mod: FakeQuantizeImplBase) -
             "Core AI export does not support PerBlockGranularity on activations: a "
             "per-block scale cannot be canonicalized to 0-D or 1-D. Use "
             "PerTensorGranularity or PerChannelGranularity, export with "
-            "backend=ExportBackend._TORCH, or install and activate an extension "
+            "backend=ExportBackend.Torch, or install and activate an extension "
             "package that registers an activation export handler for this granularity."
         )
 

@@ -6,7 +6,7 @@
 """Export preparation utilities for quantized models.
 
 This module provides functions to prepare PT2E-quantized models for different
-export backends (CoreML, CoreAI) by converting fake quantization operations to
+backends (CoreML, CoreAI, Torch) by converting fake quantization operations to
 backend-specific representations.
 """
 
@@ -646,6 +646,52 @@ def prepare_for_mil_export(model: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
     # Register metadata version
     MILCompressionMetadata.register_version(model)
+
+    model.graph.eliminate_dead_code()
+    model.recompile()
+
+    return model
+
+
+def prepare_for_torch_inference(model: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    """Fold weight fake quantization into dense weights for fast torch inference.
+
+    Each weight read through a fake quantization node is replaced by its
+    fake-quantized value, and the node and its module are removed. Activation
+    fake quantization is kept.
+
+    Args:
+        model (torch.fx.GraphModule): The quantized GraphModule. Modified in place.
+
+    Returns:
+        torch.fx.GraphModule: The same GraphModule with weight fake quantization folded.
+
+    Raises:
+        TypeError: If model is not a torch.fx.GraphModule.
+    """
+    if not isinstance(model, torch.fx.GraphModule):
+        raise TypeError("Model must be a torch.fx.GraphModule")
+
+    for node, fake_quant_mod in _collect_fake_quantize_nodes(model):
+        if not _is_weight_fake_quant(node, fake_quant_mod):
+            continue
+
+        weight_node = _get_fake_quant_input(node)
+        if len(weight_node.users) > 1:
+            logger.warning(
+                "Weight %r is also read directly by the graph; "
+                "keeping its fake quantization instead of folding it.",
+                weight_node.target,
+            )
+            continue
+
+        dense_weight = resolve_attr(model, str(weight_node.target))
+        with torch.no_grad():
+            dense_weight.data = fake_quant_mod(dense_weight.data)
+
+        node.replace_all_uses_with(weight_node)
+        model.graph.erase_node(node)
+        remove_fake_quant_module(model, node)
 
     model.graph.eliminate_dead_code()
     model.recompile()
